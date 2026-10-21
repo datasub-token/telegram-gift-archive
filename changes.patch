@@ -1,0 +1,996 @@
+diff --git a/Telegram/Telegram-iOS/en.lproj/Localizable.strings b/Telegram/Telegram-iOS/en.lproj/Localizable.strings
+index 5c82abe..64f536f 100644
+--- a/Telegram/Telegram-iOS/en.lproj/Localizable.strings
++++ b/Telegram/Telegram-iOS/en.lproj/Localizable.strings
+@@ -17096,3 +17096,9 @@ Error: %8$@";
+ "Notification.GramTransfer.UnknownUser" = "UNKNOWN USER";
+ 
+ "Chat.ViewStyle" = "VIEW STYLE";
++
++"PeerInfo.Gifts.Context.Archive" = "Archive";
++"PeerInfo.Gifts.Context.Unarchive" = "Unarchive";
++"PeerInfo.Gifts.Collections.Archive" = "Archive";
++"PeerInfo.Gifts.ToastArchived.Text" = "Gift archived.";
++"PeerInfo.Gifts.ToastUnarchived.Text" = "Gift unarchived.";
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftItemComponent/Sources/GiftItemComponent.swift b/submodules/TelegramUI/Components/Gifts/GiftItemComponent/Sources/GiftItemComponent.swift
+index 7ecc32e..a72a382 100644
+--- a/submodules/TelegramUI/Components/Gifts/GiftItemComponent/Sources/GiftItemComponent.swift
++++ b/submodules/TelegramUI/Components/Gifts/GiftItemComponent/Sources/GiftItemComponent.swift
+@@ -381,6 +381,11 @@ public final class GiftItemComponent: Component {
+             return nil
+         }
+         
++        /// The gift's sticker, for a transition that moves it on its own, without the cell's background.
++        public var stickerLayer: CALayer? {
++            return self.animationLayer
++        }
++        
+         override init(frame: CGRect) {
+             super.init(frame: frame)
+             
+diff --git a/submodules/TelegramUI/Components/PeerInfo/CollectionTabItemComponent/Sources/CollectionTabItemComponent.swift b/submodules/TelegramUI/Components/PeerInfo/CollectionTabItemComponent/Sources/CollectionTabItemComponent.swift
+index f325d96..c6178aa 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/CollectionTabItemComponent/Sources/CollectionTabItemComponent.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/CollectionTabItemComponent/Sources/CollectionTabItemComponent.swift
+@@ -17,6 +17,7 @@ public final class CollectionTabItemComponent: Component {
+     public enum Icon: Equatable {
+         case collection(TelegramMediaFile)
+         case add
++        case archive
+     }
+     
+     public let context: AccountContext
+@@ -105,12 +106,13 @@ public final class CollectionTabItemComponent: Component {
+                     }
+                     let iconFrame = CGRect(origin: CGPoint(x: iconOffset, y: floorToScreenPixels((titleSize.height - iconSize.height) * 0.5)), size: iconSize)
+                     iconLayer.frame = iconFrame
+-                case .add:
++                case .add, .archive:
+                     iconSize = self.icon.update(
+                         transition: .immediate,
+                         component: AnyComponent(BundleIconComponent(
+-                            name: "Chat/Input/Media/PanelBadgeAdd",
+-                            tintColor: component.theme.list.itemPrimaryTextColor
++                            name: icon == .archive ? "Chat List/Search/Archive" : "Chat/Input/Media/PanelBadgeAdd",
++                            tintColor: component.theme.list.itemPrimaryTextColor,
++                            maxSize: icon == .archive ? CGSize(width: 16.0, height: 16.0) : nil
+                         )),
+                         environment: {},
+                         containerSize: CGSize(width: 100.0, height: 100.0)
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayGiftsContextMenu.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayGiftsContextMenu.swift
+index a433bb1..3b3b055 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayGiftsContextMenu.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayGiftsContextMenu.swift
+@@ -32,7 +32,9 @@ extension PeerInfoScreenNode {
+         }
+         
+         let isCollection = giftsContext.collectionId != nil
+-            
++        // The archive is not a collection: gifts are not added to it from here, and its order is the profile's.
++        let isArchive = pane.currentCollection == .archive
++        
+         let strings = self.presentationData.strings
+         let items: Signal<ContextController.Items, NoError> = giftsContext.state
+         |> map { state in
+@@ -65,7 +67,7 @@ extension PeerInfoScreenNode {
+                             pane.createCollection()
+                         }
+                     })))
+-                } else {
++                } else if !isArchive {
+                     items.append(.action(ContextMenuActionItem(text: strings.PeerInfo_Gifts_AddGifts, icon: { theme in
+                         return generateTintedImage(image: UIImage(bundleImageName: "Peer Info/Gifts/AddGift"), color: theme.contextMenu.primaryColor)
+                     }, action: { [weak pane] _, f in
+@@ -77,7 +79,7 @@ extension PeerInfoScreenNode {
+                     })))
+                 }
+ 
+-                if canReorder {
++                if canReorder && !isArchive {
+                     items.append(.action(ContextMenuActionItem(text: strings.PeerInfo_Gifts_Reorder, icon: { theme in
+                         return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/ReorderItems"), color: theme.contextMenu.primaryColor)
+                     }, action: { [weak pane] _, f in
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoVisualMediaPaneNode/Sources/GiftsArchive.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoVisualMediaPaneNode/Sources/GiftsArchive.swift
+new file mode 100644
+index 0000000..0e1cc0c
+--- /dev/null
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoVisualMediaPaneNode/Sources/GiftsArchive.swift
+@@ -0,0 +1,77 @@
++import Foundation
++import SwiftSignalKit
++import TelegramCore
++import AccountContext
++
++/// The owner's archive of profile gifts. An archived gift leaves every other tab of the gifts pane and is listed in
++/// the Archive tab instead. The archive is kept on this device only, in UserDefaults per account and profile, and
++/// nothing about it is sent to the server.
++final class GiftsArchive {
++    private static var archives: [String: GiftsArchive] = [:]
++    
++    /// One instance per account and profile, so the pane and every grid it shows observe the same state.
++    static func archive(context: AccountContext, peerId: EnginePeer.Id) -> GiftsArchive {
++        let defaultsKey = "PeerInfoGiftsArchive_v1_\(context.account.peerId.toInt64())_\(peerId.toInt64())"
++        if let current = self.archives[defaultsKey] {
++            return current
++        }
++        let archive = GiftsArchive(defaultsKey: defaultsKey)
++        self.archives[defaultsKey] = archive
++        return archive
++    }
++    
++    static func itemKey(reference: StarGiftReference) -> String {
++        switch reference {
++        case let .message(messageId):
++            return "m_\(messageId.peerId.toInt64())_\(messageId.namespace)_\(messageId.id)"
++        case let .peer(peerId, id):
++            return "p_\(peerId.toInt64())_\(id)"
++        case let .slug(slug):
++            return "s_\(slug)"
++        }
++    }
++    
++    private let defaultsKey: String
++    private(set) var itemKeys: Set<String>
++    private let itemKeysPromise: ValuePromise<Set<String>>
++    
++    var itemKeysSignal: Signal<Set<String>, NoError> {
++        return self.itemKeysPromise.get()
++    }
++    
++    private init(defaultsKey: String) {
++        self.defaultsKey = defaultsKey
++        
++        let itemKeys = Set(UserDefaults.standard.stringArray(forKey: defaultsKey) ?? [])
++        self.itemKeys = itemKeys
++        self.itemKeysPromise = ValuePromise(itemKeys, ignoreRepeated: true)
++    }
++    
++    func contains(_ reference: StarGiftReference?) -> Bool {
++        guard let reference else {
++            return false
++        }
++        return self.itemKeys.contains(GiftsArchive.itemKey(reference: reference))
++    }
++    
++    func setIsArchived(_ isArchived: Bool, reference: StarGiftReference) {
++        let itemKey = GiftsArchive.itemKey(reference: reference)
++        var itemKeys = self.itemKeys
++        if isArchived {
++            itemKeys.insert(itemKey)
++        } else {
++            itemKeys.remove(itemKey)
++        }
++        if itemKeys == self.itemKeys {
++            return
++        }
++        self.itemKeys = itemKeys
++        
++        if itemKeys.isEmpty {
++            UserDefaults.standard.removeObject(forKey: self.defaultsKey)
++        } else {
++            UserDefaults.standard.set(itemKeys.sorted(), forKey: self.defaultsKey)
++        }
++        self.itemKeysPromise.set(itemKeys)
++    }
++}
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoVisualMediaPaneNode/Sources/GiftsListView.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoVisualMediaPaneNode/Sources/GiftsListView.swift
+index aa96cd0..13ae6e3 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoVisualMediaPaneNode/Sources/GiftsListView.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoVisualMediaPaneNode/Sources/GiftsListView.swift
+@@ -27,6 +27,7 @@ import UndoUI
+ import LottieComponent
+ import ButtonComponent
+ import ContextUI
++import EmojiTextAttachmentView
+ 
+ final class GiftsListView: UIView {
+     private let context: AccountContext
+@@ -38,6 +39,18 @@ final class GiftsListView: UIView {
+     private let ignoreCollection: Int32?
+     private let remainingSelectionCount: Int32
+     
++    /// With an archive, the grid lists either only the archived gifts (the Archive tab) or every gift but them.
++    private let archive: GiftsArchive?
++    private let isArchive: Bool
++    private var archivedItemKeys: Set<String>?
++    /// The gifts whose archive state the update being laid out changed: they fly between the grid and a tab.
++    private var archiveChangedItemKeys = Set<String>()
++    
++    /// The tab a gift moving between this grid and the archive flies to or from, in this view's coordinates: the
++    /// Archive tab for the main grids, the All tab for the archive's own. Nil when that tab is not on screen.
++    var archiveFlightTarget: ((_ isArchiveTab: Bool) -> CGRect?)?
++    var archiveFlightLanded: ((_ isArchiveTab: Bool) -> Void)?
++    
+     private var dataDisposable: Disposable?
+         
+     weak var parentController: ViewController?
+@@ -64,6 +77,7 @@ final class GiftsListView: UIView {
+     }
+ 
+     private let statusPromise = Promise<PeerInfoStatusData?>(nil)
++    private var currentStatus: PeerInfoStatusData?
+     var status: Signal<PeerInfoStatusData?, NoError> {
+         self.statusPromise.get()
+     }
+@@ -127,7 +141,7 @@ final class GiftsListView: UIView {
+     var contextAction: ((ProfileGiftsContext.State.StarGift, UIView, ContextGesture) -> Void)?
+     var addToCollection: (() -> Void)?
+     
+-    init(context: AccountContext, peerId: EnginePeer.Id, profileGifts: ProfileGiftsContext, giftsCollections: ProfileGiftsCollectionsContext?, canSelect: Bool, ignoreCollection: Int32? = nil, remainingSelectionCount: Int32 = 0) {
++    init(context: AccountContext, peerId: EnginePeer.Id, profileGifts: ProfileGiftsContext, giftsCollections: ProfileGiftsCollectionsContext?, canSelect: Bool, ignoreCollection: Int32? = nil, remainingSelectionCount: Int32 = 0, archive: GiftsArchive? = nil, isArchive: Bool = false) {
+         self.context = context
+         self.peerId = peerId
+         self.profileGifts = profileGifts
+@@ -135,7 +149,9 @@ final class GiftsListView: UIView {
+         self.canSelect = canSelect
+         self.ignoreCollection = ignoreCollection
+         self.remainingSelectionCount = remainingSelectionCount
+-                
++        self.archive = archive
++        self.isArchive = isArchive
++        
+         if let value = context.currentAppConfiguration.with({ $0 }).data?["stargifts_pinned_to_top_limit"] as? Double {
+             self.maxPinnedCount = Int(value)
+         } else {
+@@ -144,19 +160,37 @@ final class GiftsListView: UIView {
+         
+         super.init(frame: .zero)
+                                         
++        let archivedItemKeys: Signal<Set<String>?, NoError>
++        if let archive {
++            archivedItemKeys = archive.itemKeysSignal |> map(Optional.init)
++        } else {
++            archivedItemKeys = .single(nil)
++        }
++        
+         self.dataDisposable = combineLatest(
+             queue: Queue.mainQueue(),
+             profileGifts.state,
+-            self.reorderedReferencesPromise.get()
+-        ).startStrict(next: { [weak self] state, reorderedReferences in
++            self.reorderedReferencesPromise.get(),
++            archivedItemKeys
++        ).startStrict(next: { [weak self] state, reorderedReferences, archivedItemKeys in
+             guard let self else {
+                 return
+             }
+             let isFirstTime = self.starsProducts == nil
++            let previousArchivedItemKeys = self.archivedItemKeys
++            let archiveUpdated = !isFirstTime && previousArchivedItemKeys != archivedItemKeys
++            self.archivedItemKeys = archivedItemKeys
+             let presentationData = self.context.sharedContext.currentPresentationData.with { $0 }
+-            self.statusPromise.set(.single(PeerInfoStatusData(text: presentationData.strings.SharedMedia_GiftCount(state.count ?? 0), isActivity: true, key: .gifts)))
++            // The profile lays itself out again for every status it receives, so an unchanged one is not sent again.
++            let status = PeerInfoStatusData(text: presentationData.strings.SharedMedia_GiftCount(state.count ?? 0), isActivity: true, key: .gifts)
++            if self.currentStatus != status {
++                self.currentStatus = status
++                self.statusPromise.set(.single(status))
++            }
+             
+             if self.isReordering {
++                // Reordering keeps archived gifts in the list: the pinned order and a collection's order sent when
++                // reordering ends are read from this list, and leaving archived gifts out would unpin or drop them.
+                 var stateItems: [ProfileGiftsContext.State.StarGift] = state.gifts
+                 if let reorderedReferences {
+                     var fixedStateItems: [ProfileGiftsContext.State.StarGift] = []
+@@ -187,7 +221,14 @@ final class GiftsListView: UIView {
+                 self.starsProducts = stateItems
+                 self.pinnedReferences = Array(stateItems.filter { $0.pinnedToTop }.compactMap { $0.reference })
+             } else {
+-                self.starsProducts = state.filteredGifts
++                var gifts = state.filteredGifts
++                if let archivedItemKeys {
++                    gifts = gifts.filter { gift in
++                        let isArchived = gift.reference.flatMap { archivedItemKeys.contains(GiftsArchive.itemKey(reference: $0)) } ?? false
++                        return isArchived == self.isArchive
++                    }
++                }
++                self.starsProducts = gifts
+                 self.pinnedReferences = Array(state.gifts.filter { $0.pinnedToTop }.compactMap { $0.reference })
+             }
+             
+@@ -199,7 +240,13 @@ final class GiftsListView: UIView {
+                 self.ready.set(.single(true))
+             }
+             
+-            let _ = self.updateScrolling(transition: isFirstTime ? .immediate : .easeInOut(duration: 0.25))
++            // A gift moving to or from the archive flies between its cell and the tab, and the rest of the grid
++            // closes or opens the gap with a spring.
++            if archiveUpdated {
++                self.archiveChangedItemKeys = (previousArchivedItemKeys ?? Set()).symmetricDifference(archivedItemKeys ?? Set())
++            }
++            let _ = self.updateScrolling(transition: isFirstTime ? .immediate : (archiveUpdated ? .spring(duration: 0.4) : .easeInOut(duration: 0.25)))
++            self.archiveChangedItemKeys.removeAll()
+             
+             Queue.mainQueue().justDispatch {
+                 self.onContentUpdated()
+@@ -403,6 +450,77 @@ final class GiftsListView: UIView {
+         self.profileGifts.loadMore()
+     }
+     
++    private static let archiveFlightDuration: Double = 0.6
++    /// The model arrives at about the size of the tab's icon.
++    private static let archiveFlightTabSide: CGFloat = 20.0
++    
++    /// A gift that left this grid for the archive (or back): its cell fades away where it is, while the gift's model
++    /// alone flies into the tab. With no tab on screen the model fades with the cell.
++    private func animateArchiveDeparture(itemView: UIView) {
++        let isArchiveTab = !self.isArchive
++        itemView.isUserInteractionEnabled = false
++        
++        if let targetFrame = self.archiveFlightTarget?(isArchiveTab), let stickerLayer = (itemView as? GiftItemComponent.View)?.stickerLayer, stickerLayer.superlayer === itemView.layer {
++            let duration = GiftsListView.archiveFlightDuration
++            let cellPosition = itemView.layer.presentation()?.position ?? itemView.layer.position
++            let sourcePosition = CGPoint(x: cellPosition.x + stickerLayer.position.x - itemView.bounds.midX, y: cellPosition.y + stickerLayer.position.y - itemView.bounds.midY)
++            let targetPosition = targetFrame.center
++            
++            // The model leaves its cell, which is going away, and travels above the whole grid. It holds its current
++            // pose: moving the layer would otherwise restart its animation from the first frame.
++            (stickerLayer as? InlineStickerItemLayer)?.isVisibleForAnimations = false
++            stickerLayer.removeFromSuperlayer()
++            stickerLayer.position = targetPosition
++            self.layer.addSublayer(stickerLayer)
++            
++            stickerLayer.animateKeyframes(values: giftArchiveFlightKeyframes(from: sourcePosition, to: targetPosition, duration: duration).map { NSValue(cgPoint: $0) }, duration: duration, keyPath: "position", removeOnCompletion: false, completion: { [weak self, weak stickerLayer] _ in
++                stickerLayer?.removeFromSuperlayer()
++                self?.archiveFlightLanded?(isArchiveTab)
++            })
++            stickerLayer.animateScale(from: 1.0, to: GiftsListView.archiveFlightTabSide / max(1.0, stickerLayer.bounds.width), duration: duration, timingFunction: kCAMediaTimingFunctionSpring, removeOnCompletion: false)
++            stickerLayer.animateAlpha(from: 1.0, to: 0.0, duration: 0.15, delay: duration - 0.15, removeOnCompletion: false)
++        }
++        
++        itemView.layer.animateScale(from: 1.0, to: 0.9, duration: 0.45, timingFunction: kCAMediaTimingFunctionSpring, removeOnCompletion: false)
++        itemView.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.35, removeOnCompletion: false, completion: { [weak itemView] _ in
++            itemView?.removeFromSuperview()
++        })
++    }
++    
++    /// A gift that came into this grid from the archive (or from the main grid): its cell fades in where it is, while
++    /// the gift's model flies out of the tab into it. With no tab on screen the model fades in with the cell.
++    private func animateArchiveArrival(itemView: UIView) {
++        itemView.layer.animateScale(from: 0.9, to: 1.0, duration: 0.45, timingFunction: kCAMediaTimingFunctionSpring)
++        itemView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.35)
++        
++        guard let sourceFrame = self.archiveFlightTarget?(!self.isArchive), let stickerLayer = (itemView as? GiftItemComponent.View)?.stickerLayer, stickerLayer.superlayer === itemView.layer else {
++            return
++        }
++        let duration = GiftsListView.archiveFlightDuration
++        let stickerFrame = stickerLayer.frame
++        let stickerIndex = itemView.layer.sublayers?.firstIndex(where: { $0 === stickerLayer }) ?? 0
++        let targetPosition = itemView.layer.convert(stickerLayer.position, to: self.layer)
++        
++        // The model travels outside its cell, so it stays opaque while the cell fades in, and returns to the cell
++        // once it has landed.
++        stickerLayer.removeFromSuperlayer()
++        stickerLayer.position = targetPosition
++        self.layer.addSublayer(stickerLayer)
++        
++        stickerLayer.animateKeyframes(values: giftArchiveFlightKeyframes(from: sourceFrame.center, to: targetPosition, duration: duration).map { NSValue(cgPoint: $0) }, duration: duration, keyPath: "position", completion: { [weak itemView, weak stickerLayer] _ in
++            guard let stickerLayer else {
++                return
++            }
++            stickerLayer.removeFromSuperlayer()
++            if let itemView, itemView.superview != nil {
++                stickerLayer.frame = stickerFrame
++                itemView.layer.insertSublayer(stickerLayer, at: UInt32(min(stickerIndex, itemView.layer.sublayers?.count ?? 0)))
++            }
++        })
++        stickerLayer.animateScale(from: GiftsListView.archiveFlightTabSide / max(1.0, stickerLayer.bounds.width), to: 1.0, duration: duration, timingFunction: kCAMediaTimingFunctionSpring)
++        stickerLayer.animateAlpha(from: 0.0, to: 1.0, duration: 0.15)
++    }
++    
+     @discardableResult
+     private func updateScrolling(interactive: Bool = false, transition: ComponentTransition) -> CGFloat {
+         guard let topInset = self.topInset, let visibleBounds = self.visibleBounds else {
+@@ -703,10 +821,13 @@ final class GiftsListView: UIView {
+                     containerSize: starsOptionSize
+                 )
+                 if let itemView = visibleItem.view {
++                    var isArrivingFromArchiveTab = false
+                     if itemView.superview == nil {
+                         self.addSubview(itemView)
+                         
+-                        if !transition.animation.isImmediate {
++                        if let reference = product.reference, self.archiveChangedItemKeys.contains(GiftsArchive.itemKey(reference: reference)) {
++                            isArrivingFromArchiveTab = true
++                        } else if !transition.animation.isImmediate {
+                             itemView.layer.animateScale(from: 0.01, to: 1.0, duration: 0.25)
+                             itemView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.25)
+                         }
+@@ -737,6 +858,10 @@ final class GiftsListView: UIView {
+                             itemView.layer.removeAnimation(forKey: "shaking_rotation")
+                         }
+                     }
++                    
++                    if isArrivingFromArchiveTab {
++                        self.animateArchiveArrival(itemView: itemView)
++                    }
+                 }
+             }
+             itemFrame.origin.x += itemFrame.width + optionSpacing
+@@ -752,7 +877,9 @@ final class GiftsListView: UIView {
+             if !validIds.contains(id) {
+                 removeIds.append(id)
+                 if let itemView = item.1.view {
+-                    if !transition.animation.isImmediate {
++                    if let reference = item.0, self.archiveChangedItemKeys.contains(GiftsArchive.itemKey(reference: reference)) {
++                        self.animateArchiveDeparture(itemView: itemView)
++                    } else if !transition.animation.isImmediate {
+                         itemView.layer.animateScale(from: 1.0, to: 0.01, duration: 0.25, removeOnCompletion: false)
+                         itemView.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.25, removeOnCompletion: false, completion: { _ in
+                             itemView.removeFromSuperview()
+@@ -1052,6 +1179,24 @@ final class GiftsListView: UIView {
+     }
+ }
+ 
++/// A gift's path between its cell and a tab: a curve rising a little above the higher end, so the gift drops into
++/// the tab (or out of it into the cell), timed with the spring curve.
++private func giftArchiveFlightKeyframes(from sourcePoint: CGPoint, to targetPoint: CGPoint, duration: Double) -> [CGPoint] {
++    let controlPoint = CGPoint(x: (sourcePoint.x + targetPoint.x) * 0.5, y: min(sourcePoint.y, targetPoint.y) - 60.0)
++    let count = max(2, Int(ceil(120.0 * duration)))
++    
++    var keyframes: [CGPoint] = []
++    for i in 0 ..< count {
++        let t = ComponentTransition.Animation.Curve.spring.solve(at: CGFloat(i) / CGFloat(count - 1))
++        let u = 1.0 - t
++        keyframes.append(CGPoint(
++            x: u * u * sourcePoint.x + 2.0 * u * t * controlPoint.x + t * t * targetPoint.x,
++            y: u * u * sourcePoint.y + 2.0 * u * t * controlPoint.y + t * t * targetPoint.y
++        ))
++    }
++    return keyframes
++}
++
+ private extension StarGiftReference {
+     var stringValue: String {
+         switch self {
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoVisualMediaPaneNode/Sources/PeerInfoGiftsPaneNode.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoVisualMediaPaneNode/Sources/PeerInfoGiftsPaneNode.swift
+index ee9ea2d..9eb7bcd 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoVisualMediaPaneNode/Sources/PeerInfoGiftsPaneNode.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoVisualMediaPaneNode/Sources/PeerInfoGiftsPaneNode.swift
+@@ -42,6 +42,7 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+         case all
+         case collection(Int32)
+         case create
++        case archive
+         
+         init(rawValue: Int32) {
+             switch rawValue {
+@@ -49,6 +50,8 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+                 self = .all
+             case -1:
+                 self = .create
++            case -2:
++                self = .archive
+             default:
+                 self = .collection(rawValue)
+             }
+@@ -60,6 +63,8 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+                 return 0
+             case .create:
+                 return -1
++            case .archive:
++                return -2
+             case let .collection(id):
+                 return id
+             }
+@@ -107,6 +112,22 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+     private var reorderedCollectionIds: [Int32]?
+     private var isReordering = false
+     
++    /// Only the profile's owner has an archive, and with it the Archive tab.
++    private let giftsArchive: GiftsArchive?
++    private var archiveDisposable: Disposable?
++    private var hasArchivedGifts = false
++    private var isClosingArchiveTab = false
++    private var animateNextTabSelectorItemChanges = false
++    /// The last laid out frames of the Archive tab (true) and the All tab (false), in the scroll view's coordinates.
++    /// Kept after the Archive tab goes, so a gift taken back out of it still flies from where it was.
++    private var archiveFlightTabFrames: [Bool: CGRect] = [:]
++    
++    /// While the bottom panel is shown, toasts are raised above it instead of covering its button.
++    private var toastBottomInset: CGFloat?
++    private var toastAppearance: UndoOverlayController.Appearance? {
++        return self.toastBottomInset.flatMap { UndoOverlayController.Appearance(bottomInset: $0) }
++    }
++    
+     private let ready = Promise<Bool>()
+     private var didSetReady: Bool = false
+     public var isReady: Signal<Bool, NoError> {
+@@ -147,9 +168,13 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+             self.collectionsMaxCount = 6
+         }
+         
++        let giftsArchive: GiftsArchive? = (peerId == context.account.peerId || canManage) ? GiftsArchive.archive(context: context, peerId: peerId) : nil
++        self.giftsArchive = giftsArchive
++        self.hasArchivedGifts = !(giftsArchive?.itemKeys.isEmpty ?? true)
++        
+         self.backgroundNode = ASDisplayNode()
+         self.scrollNode = ASScrollNode()
+-        self.giftsListView = GiftsListView(context: context, peerId: peerId, profileGifts: profileGifts, giftsCollections: profileGiftsCollections, canSelect: false)
++        self.giftsListView = GiftsListView(context: context, peerId: peerId, profileGifts: profileGifts, giftsCollections: profileGiftsCollections, canSelect: false, archive: giftsArchive)
+                 
+         super.init()
+                 
+@@ -179,6 +204,7 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+             }
+             self.displayUnpinScreen(gift: gift, completion: completion)
+         }
++        self.setupArchiveFlights(giftsListView: self.giftsListView)
+         
+         self.collectionsDisposable = (profileGiftsCollections.state
+         |> deliverOnMainQueue).start(next: { [weak self] state in
+@@ -189,6 +215,17 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+             self.updateScrolling(transition: .easeInOut(duration: 0.2))
+         })
+         
++        if let giftsArchive {
++            self.archiveDisposable = (giftsArchive.itemKeysSignal
++            |> map { itemKeys -> Bool in
++                return !itemKeys.isEmpty
++            }
++            |> distinctUntilChanged
++            |> deliverOnMainQueue).startStrict(next: { [weak self] hasArchivedGifts in
++                self?.updateHasArchivedGifts(hasArchivedGifts)
++            })
++        }
++        
+         if let initialGiftCollectionId {
+             self.setCurrentCollection(collection: .collection(Int32(initialGiftCollectionId)))
+         }
+@@ -205,6 +242,7 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+     
+     deinit {
+         self.collectionsDisposable?.dispose()
++        self.archiveDisposable?.dispose()
+     }
+         
+     public override func didLoad() {
+@@ -347,6 +385,104 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+         }
+     }
+     
++    private func updateHasArchivedGifts(_ hasArchivedGifts: Bool, deferClosingArchiveTab: Bool = true) {
++        if self.hasArchivedGifts == hasArchivedGifts {
++            return
++        }
++        if !hasArchivedGifts, case .archive = self.currentCollection, deferClosingArchiveTab {
++            // The last gift flies to the All tab first; the Archive tab closes once it has landed.
++            if !self.isClosingArchiveTab {
++                self.isClosingArchiveTab = true
++                Queue.mainQueue().after(0.5, { [weak self] in
++                    guard let self else {
++                        return
++                    }
++                    self.isClosingArchiveTab = false
++                    self.updateHasArchivedGifts(!(self.giftsArchive?.itemKeys.isEmpty ?? true), deferClosingArchiveTab: false)
++                })
++            }
++            return
++        }
++        self.hasArchivedGifts = hasArchivedGifts
++        
++        // The Archive tab comes with the first archived gift and goes with the last one.
++        self.animateNextTabSelectorItemChanges = true
++        if !hasArchivedGifts, case .archive = self.currentCollection {
++            self.setCurrentCollection(collection: .all)
++        } else {
++            self.updateScrolling(transition: .spring(duration: 0.4))
++        }
++    }
++    
++    private func setupArchiveFlights(giftsListView: GiftsListView) {
++        giftsListView.archiveFlightTarget = { [weak self, weak giftsListView] isArchiveTab in
++            // A grid that is sliding away has no tab to fly to.
++            guard let self, let giftsListView, giftsListView === self.giftsListView, let frame = self.archiveFlightTabFrames[isArchiveTab], self.scrollNode.view.bounds.intersects(frame) else {
++                return nil
++            }
++            return self.scrollNode.view.convert(frame, to: giftsListView)
++        }
++        giftsListView.archiveFlightLanded = { [weak self] isArchiveTab in
++            guard let self, let tabSelectorView = self.tabSelector.view as? TabSelectorComponent.View else {
++                return
++            }
++            tabSelectorView.animateItemBounce(AnyHashable(isArchiveTab ? GiftCollection.archive.rawValue : GiftCollection.all.rawValue))
++        }
++    }
++    
++    private func setGift(_ gift: ProfileGiftsContext.State.StarGift, isArchived: Bool, displayToast: Bool = true) {
++        guard let giftsArchive = self.giftsArchive, let reference = gift.reference, let presentationData = self.currentParams?.presentationData else {
++            return
++        }
++        // The tab row is updated before the grids, so the gift leaving a grid has its tab to fly to.
++        var itemKeys = giftsArchive.itemKeys
++        if isArchived {
++            itemKeys.insert(GiftsArchive.itemKey(reference: reference))
++        } else {
++            itemKeys.remove(GiftsArchive.itemKey(reference: reference))
++        }
++        self.updateHasArchivedGifts(!itemKeys.isEmpty)
++        giftsArchive.setIsArchived(isArchived, reference: reference)
++        
++        if !displayToast {
++            return
++        }
++        
++        var animationFile: TelegramMediaFile?
++        switch gift.gift {
++        case let .generic(gift):
++            animationFile = gift.file
++        case let .unique(gift):
++            for attribute in gift.attributes {
++                if case let .model(_, file, _, _) = attribute {
++                    animationFile = file
++                    break
++                }
++            }
++        }
++        
++        let text = isArchived ? presentationData.strings.PeerInfo_Gifts_ToastArchived_Text : presentationData.strings.PeerInfo_Gifts_ToastUnarchived_Text
++        let undoText: String? = isArchived ? presentationData.strings.Undo_Undo : nil
++        let content: UndoOverlayContent
++        if let animationFile {
++            content = .sticker(context: self.context, file: animationFile, loop: false, title: nil, text: text, undoText: undoText, customAction: nil)
++        } else {
++            content = .actionSucceeded(title: nil, text: text, cancel: undoText, destructive: false)
++        }
++        // The toast follows a moment later, so that setting it up does not cost the first frames of the gift's flight.
++        Queue.mainQueue().after(0.2, { [weak self] in
++            guard let self else {
++                return
++            }
++            self.parentController?.present(UndoOverlayController(presentationData: presentationData, content: content, elevatedLayout: true, appearance: self.toastAppearance, action: { [weak self] action in
++                if case .undo = action {
++                    self?.setGift(gift, isArchived: false, displayToast: false)
++                }
++                return true
++            }), in: .current)
++        })
++    }
++    
+     public func ensureMessageIsVisible(id: EngineMessage.Id) {
+     }
+     
+@@ -411,13 +547,16 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+             return
+         }
+         var animateRight = false
+-        if case let .collection(currentId) = self.currentCollection {
++        if case .archive = collection {
++            // The Archive tab follows every collection.
++            animateRight = true
++        } else if case let .collection(currentId) = self.currentCollection {
+             if case let .collection(nextId) = collection {
+                 if let currentIndex = self.collections?.firstIndex(where: { $0.id == currentId }), let nextIndex = self.collections?.firstIndex(where: { $0.id == nextId }) {
+                     animateRight = nextIndex > currentIndex
+                 }
+             }
+-        } else {
++        } else if self.currentCollection != .archive {
+             animateRight = true
+         }
+ 
+@@ -430,11 +569,14 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+         default:
+             profileGifts = self.profileGifts
+         }
+-        if case .ready = profileGifts.currentState?.dataState {
++        // All and Archive show the same gifts: moving between them keeps what is loaded, as a reload would drop every
++        // gift past the first page and bring them back page by page.
++        let isSameGifts = (self.currentCollection == .all || self.currentCollection == .archive) && (collection == .all || collection == .archive)
++        if !isSameGifts, case .ready = profileGifts.currentState?.dataState {
+             profileGifts.reload()
+         }
+ 
+-        self.giftsListView = GiftsListView(context: self.context, peerId: self.peerId, profileGifts: profileGifts, giftsCollections: self.profileGiftsCollections, canSelect: false)
++        self.giftsListView = GiftsListView(context: self.context, peerId: self.peerId, profileGifts: profileGifts, giftsCollections: self.profileGiftsCollections, canSelect: false, archive: self.giftsArchive, isArchive: collection == .archive)
+         self.giftsListView.addToCollection = { [weak self] in
+             guard let self else {
+                 return
+@@ -468,6 +610,7 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+             }
+             self.contextAction(gift: gift, view: view, gesture: gesture)
+         }
++        self.setupArchiveFlights(giftsListView: self.giftsListView)
+         self.giftsListView.parentController = self.parentController
+         self.giftsListView.frame = previousGiftsListView.frame
+                                         
+@@ -593,7 +736,7 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+             }
+             
+             let hasNonEmptyCollections = self.collections?.contains(where: { $0.count > 0 }) ?? false
+-            if let collections = self.collections, !collections.isEmpty && (hasNonEmptyCollections || canEditCollections) {
++            if let collections = self.collections, (!collections.isEmpty && (hasNonEmptyCollections || canEditCollections)) || self.hasArchivedGifts {
+                 var tabSelectorItems: [TabSelectorComponent.Item] = []
+                 tabSelectorItems.append(TabSelectorComponent.Item(
+                     id: AnyHashable(GiftCollection.all.rawValue),
+@@ -639,6 +782,21 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+                     ))
+                 }
+                         
++                if self.hasArchivedGifts {
++                    tabSelectorItems.append(TabSelectorComponent.Item(
++                        id: AnyHashable(GiftCollection.archive.rawValue),
++                        content: .component(AnyComponent(
++                            CollectionTabItemComponent(
++                                context: self.context,
++                                icon: .archive,
++                                title: params.presentationData.strings.PeerInfo_Gifts_Collections_Archive,
++                                theme: params.presentationData.theme
++                            )
++                        )),
++                        isReorderable: false
++                    ))
++                }
++                
+                 if canEditCollections {
+                     tabSelectorItems.append(TabSelectorComponent.Item(
+                         id: AnyHashable(GiftCollection.create.rawValue),
+@@ -654,8 +812,16 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+                     ))
+                 }
+                 
++                var tabSelectorTransition = transition
++                var revealsArchiveTab = false
++                if self.animateNextTabSelectorItemChanges && !transition.animation.isImmediate {
++                    self.animateNextTabSelectorItemChanges = false
++                    revealsArchiveTab = self.hasArchivedGifts
++                    tabSelectorTransition = transition.withUserData(TabSelectorComponent.TransitionHint(scrollToEnd: false, animateItemChanges: true))
++                }
++                
+                 let tabSelectorSize = self.tabSelector.update(
+-                    transition: transition,
++                    transition: tabSelectorTransition,
+                     component: AnyComponent(TabSelectorComponent(
+                         context: self.context,
+                         colors: TabSelectorComponent.Colors(
+@@ -707,22 +873,54 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+                     containerSize: CGSize(width: params.size.width - 14.0 * 2.0, height: 44.0)
+                 )
+                 if let tabSelectorView = self.tabSelector.view {
+-                    if tabSelectorView.superview == nil {
++                    // The row also comes back while it is still fading out, e.g. when a gift is archived again right
++                    // after the archive emptied.
++                    var tabSelectorFrameTransition = transition
++                    if tabSelectorView.superview == nil || tabSelectorView.alpha == 0.0 {
++                        if tabSelectorView.superview == nil {
++                            // A row that is not on screen takes its place at once instead of growing out of its last frame.
++                            tabSelectorFrameTransition = .immediate
++                            self.scrollNode.view.insertSubview(tabSelectorView, at: 0)
++                        }
+                         tabSelectorView.alpha = 1.0
+-                        self.scrollNode.view.insertSubview(tabSelectorView, at: 0)
++                        tabSelectorView.layer.removeAnimation(forKey: "opacity")
++                        tabSelectorView.layer.removeAnimation(forKey: "transform.scale")
+                         
+                         if !transition.animation.isImmediate {
+-                            tabSelectorView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.25)
++                            tabSelectorView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.35)
++                            tabSelectorView.layer.animateSpring(from: 0.92 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.5, damping: 88.0)
++                        }
++                    }
++                    tabSelectorFrameTransition.setFrame(view: tabSelectorView, frame: CGRect(origin: CGPoint(x: floor((params.size.width - tabSelectorSize.width) / 2.0), y: topInset), size: tabSelectorSize))
++                    
++                    if let tabSelectorView = tabSelectorView as? TabSelectorComponent.View {
++                        if revealsArchiveTab && tabSelectorView.contentSize.width > tabSelectorView.bounds.width {
++                            // A new Archive tab sits next to the end of a row that does not fit: the row scrolls to it.
++                            tabSelectorView.scrollToEnd()
++                        }
++                        let visibleRowBounds = tabSelectorView.bounds.insetBy(dx: 16.0, dy: 0.0)
++                        for isArchiveTab in [false, true] {
++                            guard let itemFrame = tabSelectorView.frameForItem(AnyHashable(isArchiveTab ? GiftCollection.archive.rawValue : GiftCollection.all.rawValue)) else {
++                                continue
++                            }
++                            // A tab scrolled out of the row is approached from the row's edge.
++                            let itemCenter = CGPoint(x: max(visibleRowBounds.minX, min(visibleRowBounds.maxX, itemFrame.midX)), y: itemFrame.midY)
++                            self.archiveFlightTabFrames[isArchiveTab] = tabSelectorView.convert(itemFrame.size.centered(around: itemCenter), to: self.scrollNode.view)
+                         }
+                     }
+-                    transition.setFrame(view: tabSelectorView, frame: CGRect(origin: CGPoint(x: floor((params.size.width - tabSelectorSize.width) / 2.0), y: topInset), size: tabSelectorSize))
+                     
+                     topInset += tabSelectorSize.height + 15.0
+                 }
+-            } else if let tabSelectorView = self.tabSelector.view {
++            } else if let tabSelectorView = self.tabSelector.view, tabSelectorView.superview != nil, tabSelectorView.alpha != 0.0 {
++                // Fades out once: a later update while it fades must neither restart the fade nor cut it short.
++                self.animateNextTabSelectorItemChanges = false
+                 tabSelectorView.alpha = 0.0
+-                tabSelectorView.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.25, completion: { _ in
+-                    tabSelectorView.removeFromSuperview()
++                tabSelectorView.layer.animateScale(from: 1.0, to: 0.9, duration: 0.25, removeOnCompletion: false)
++                tabSelectorView.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.25, completion: { [weak tabSelectorView] _ in
++                    if let tabSelectorView, tabSelectorView.alpha == 0.0 {
++                        tabSelectorView.removeFromSuperview()
++                        tabSelectorView.layer.removeAnimation(forKey: "transform.scale")
++                    }
+                 })
+             }
+             
+@@ -774,7 +972,7 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+             let buttonTitle: String
+             var buttonIconName: String?
+             if self.peerId == self.context.account.peerId {
+-                if case .all = self.currentCollection {
++                if self.currentCollection == .all || self.currentCollection == .archive {
+                     buttonTitle = params.presentationData.strings.PeerInfo_Gifts_Send
+                 } else {
+                     buttonTitle = params.presentationData.strings.PeerInfo_Gifts_AddGiftsButton
+@@ -916,6 +1114,9 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+             
+             ComponentTransition.spring(duration: 0.4).setSublayerTransform(view: panelContentContainer, transform: CATransform3DMakeTranslation(0.0, bottomPanelHeight * (1.0 - panelVisibility), 0.0))
+             
++            // A toast sits on the screen's bottom inset plus this, 12 points above it: just over the panel's top.
++            self.toastBottomInset = panelVisibility > 0.0 ? max(49.0, bottomPanelHeight - bottomInset - 4.0) : nil
++            
+             contentHeight += bottomPanelHeight
+             bottomScrollInset = bottomPanelHeight - 40.0
+             contentHeight += params.bottomInset
+@@ -978,6 +1179,9 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+         } else {
+             canReorder = true
+         }
++        if case .archive = self.currentCollection {
++            canReorder = false
++        }
+         
+         let profileGifts: ProfileGiftsContext
+         switch self.currentCollection {
+@@ -987,8 +1191,19 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+             profileGifts = self.profileGifts
+         }
+         
++        let isArchived = self.giftsArchive?.contains(gift.reference) ?? false
++        var archiveItem: ContextMenuItem?
++        if canManage, self.giftsArchive != nil, gift.reference != nil {
++            archiveItem = .action(ContextMenuActionItem(text: isArchived ? strings.PeerInfo_Gifts_Context_Unarchive : strings.PeerInfo_Gifts_Context_Archive, icon: { theme in generateTintedImage(image: UIImage(bundleImageName: isArchived ? "Chat/Context Menu/Unarchive" : "Chat/Context Menu/Archive"), color: theme.contextMenu.primaryColor) }, action: { [weak self] c, _ in
++                c?.dismiss(completion: { [weak self] in
++                    self?.setGift(gift, isArchived: !isArchived)
++                })
++            }))
++        }
++        
+         var items: [ContextMenuItem] = []
+-        if canManage {
++        // An archived gift is not added to collections from the Archive tab: it is unarchived first.
++        if canManage && !isArchived {
+             items.append(.action(ContextMenuActionItem(text: strings.PeerInfo_Gifts_Context_AddToCollection, textLayout: .twoLinesMax, icon: { theme in generateTintedImage(image: UIImage(bundleImageName: "Peer Info/Gifts/AddToCollection"), color: theme.contextMenu.primaryColor) }, action: { [weak self] c, f in
+                 var subItems: [ContextMenuItem] = []
+                 
+@@ -1091,6 +1306,12 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+                 
+                 c?.pushItems(items: .single(ContextController.Items(content: .list(subItems))))
+             })))
++            if let archiveItem {
++                items.append(archiveItem)
++            }
++            items.append(.separator)
++        } else if let archiveItem {
++            items.append(archiveItem)
+             items.append(.separator)
+         }
+         
+@@ -1311,11 +1532,13 @@ public final class PeerInfoGiftsPaneNode: ASDisplayNode, PeerInfoPaneNode, UIScr
+                                 presentationData: presentationData,
+                                 content: .sticker(context: context, file: animationFile, loop: false, title: nil, text: text, undoText: nil, customAction: nil),
+                                 elevatedLayout: true,
++                                appearance: self.toastAppearance,
+                                 action: { _ in
+                                     return true
+                                 }
+                             )
+-                            self.parentController?.present(resultController, in: .window(.root))
++                            // Presented over the profile, whose bottom panel the toast is placed above.
++                            self.parentController?.present(resultController, in: .current)
+                         }
+                     }
+                 })
+diff --git a/submodules/TelegramUI/Components/TabSelectorComponent/Sources/TabSelectorComponent.swift b/submodules/TelegramUI/Components/TabSelectorComponent/Sources/TabSelectorComponent.swift
+index 242c4f2..95257d7 100644
+--- a/submodules/TelegramUI/Components/TabSelectorComponent/Sources/TabSelectorComponent.swift
++++ b/submodules/TelegramUI/Components/TabSelectorComponent/Sources/TabSelectorComponent.swift
+@@ -17,9 +17,12 @@ public final class TabSelectorComponent: Component {
+     
+     public final class TransitionHint {
+         public let scrollToEnd: Bool
++        /// Items added or removed by this update scale and fade in or out instead of appearing and disappearing at once.
++        public let animateItemChanges: Bool
+         
+-        public init(scrollToEnd: Bool) {
++        public init(scrollToEnd: Bool, animateItemChanges: Bool = false) {
+             self.scrollToEnd = scrollToEnd
++            self.animateItemChanges = animateItemChanges
+         }
+     }
+     
+@@ -524,7 +527,20 @@ public final class TabSelectorComponent: Component {
+             return nil
+         }
+         
++        /// Briefly enlarges an item and springs it back, e.g. when something has just landed on it.
++        public func animateItemBounce(_ id: AnyHashable) {
++            guard let item = self.visibleItems[id] else {
++                return
++            }
++            item.layer.animateScale(from: 1.0, to: 1.15, duration: 0.12, removeOnCompletion: false, completion: { [weak item] _ in
++                item?.layer.animateSpring(from: 1.15 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.5, damping: 45.0)
++            })
++        }
++        
+         func update(component: TabSelectorComponent, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++            // A selector that is laid out for the first time puts its selection in place at once, rather than moving
++            // it in from the corner when that first layout is animated.
++            let selectionTransition: ComponentTransition = self.component == nil ? .immediate : transition
+             let selectionColorUpdated = component.colors.selection != self.component?.colors.selection
+            
+             self.component = component
+@@ -587,12 +603,17 @@ public final class TabSelectorComponent: Component {
+             var index = 0
+             var itemViews: [AnyHashable: (VisibleItem, CGSize, ComponentTransition)] = [:]
+             
++            // Only a selector that is already laid out animates its item changes; a new one shows its items at once.
++            let animateItemChanges = !transition.animation.isImmediate && self.bounds.width > 0.0 && transition.userData(TransitionHint.self)?.animateItemChanges == true
++            var insertedIds = Set<AnyHashable>()
++            
+             for item in component.items {
+                 var itemTransition = transition
+                 let itemView: VisibleItem
+                 if let current = self.visibleItems[item.id] {
+                     itemView = current
+                 } else {
++                    insertedIds.insert(item.id)
+                     let itemId = item.id
+                     itemView = VisibleItem(action: { [weak self] in
+                         guard let self, let component = self.component else {
+@@ -738,6 +759,11 @@ public final class TabSelectorComponent: Component {
+                     
+                     itemTransition.setAlpha(view: itemTitleView, alpha: itemAlpha)
+                 }
++                
++                if animateItemChanges && insertedIds.contains(item.id) {
++                    itemView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.3)
++                    itemView.layer.animateSpring(from: 0.6 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.5, damping: 70.0)
++                }
+             }
+             contentWidth += spacing
+             
+@@ -745,7 +771,15 @@ public final class TabSelectorComponent: Component {
+             for (id, itemView) in self.visibleItems {
+                 if !validIds.contains(id) {
+                     removeIds.append(id)
+-                    itemView.removeFromSuperview()
++                    if animateItemChanges {
++                        itemView.isUserInteractionEnabled = false
++                        itemView.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.25, removeOnCompletion: false)
++                        itemView.layer.animateScale(from: 1.0, to: 0.6, duration: 0.3, removeOnCompletion: false, completion: { [weak itemView] _ in
++                            itemView?.removeFromSuperview()
++                        })
++                    } else {
++                        itemView.removeFromSuperview()
++                    }
+                 }
+             }
+             for id in removeIds {
+@@ -772,16 +806,16 @@ public final class TabSelectorComponent: Component {
+                     var mappedSelectionFrame = effectiveBackgroundRect.insetBy(dx: innerInset, dy: 0.0)
+                     mappedSelectionFrame.origin.y = mappedSelectionFrame.maxY + 7.0
+                     mappedSelectionFrame.size.height = 3.0
+-                    transition.setPosition(view: self.selectionView, position: mappedSelectionFrame.center)
+-                    transition.setBounds(view: self.selectionView, bounds: CGRect(origin: CGPoint(), size: mappedSelectionFrame.size))
+-                    transition.setTransform(view: self.selectionView, transform: CATransform3DIdentity)
++                    selectionTransition.setPosition(view: self.selectionView, position: mappedSelectionFrame.center)
++                    selectionTransition.setBounds(view: self.selectionView, bounds: CGRect(origin: CGPoint(), size: mappedSelectionFrame.size))
++                    selectionTransition.setTransform(view: self.selectionView, transform: CATransform3DIdentity)
+                 } else {
+-                    transition.setPosition(view: self.selectionView, position: selectedBackgroundRect.center)
+-                    transition.setBounds(view: self.selectionView, bounds: CGRect(origin: CGPoint(), size: selectedBackgroundRect.size))
++                    selectionTransition.setPosition(view: self.selectionView, position: selectedBackgroundRect.center)
++                    selectionTransition.setBounds(view: self.selectionView, bounds: CGRect(origin: CGPoint(), size: selectedBackgroundRect.size))
+                     if selectedItemIsReordering {
+-                        transition.setTransform(view: self.selectionView, transform: CATransform3DMakeScale(1.1, 1.1, 1.0))
++                        selectionTransition.setTransform(view: self.selectionView, transform: CATransform3DMakeScale(1.1, 1.1, 1.0))
+                     } else {
+-                        transition.setTransform(view: self.selectionView, transform: CATransform3DIdentity)
++                        selectionTransition.setTransform(view: self.selectionView, transform: CATransform3DIdentity)
+                     }
+                 }
+             } else {
